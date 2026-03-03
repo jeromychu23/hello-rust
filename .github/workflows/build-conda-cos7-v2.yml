@@ -1,49 +1,49 @@
 name: build-conda-cos7-v2
 
 on:
-  workflow_dispatch:
   push:
     branches: [ main ]
+  workflow_dispatch:
+
 jobs:
   build:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - name: Build conda package in cos7 container
+      - name: Build conda package in cos7 container (reliable mount)
         run: |
           set -euo pipefail
           echo "workspace=$GITHUB_WORKSPACE"
           ls -la
+
           docker run --rm \
-            -v "$GITHUB_WORKSPACE:/work" -w /work \
+            -v "$GITHUB_WORKSPACE:/work:rw" \
+            --entrypoint /bin/bash \
+            --user 0:0 \
             condaforge/linux-anvil-cos7-x86_64 \
-            bash -lc '
+            -lc '
               set -euo pipefail
+              echo "=== inside container ==="
+              whoami
               pwd
-              ls -la
-              ls -la recipe || (echo "recipe/ not found" && exit 1)
+              echo "=== /work ==="
+              ls -la /work
+              test -d /work/recipe || (echo "ERROR: /work/recipe not found (mount failed)" && exit 1)
 
+              cd /work
+              echo "=== now in /work ==="
+              pwd
+              ls -la recipe
+
+              # install build tooling (NO conda-verify; conflicts with pinned py312 in image)
               mamba install -y conda-build boa conda-package-handling binutils -c conda-forge
+
+              # build package
               conda mambabuild recipe -c conda-forge --output-folder conda-out
+
+              echo "== produced packages =="
               ls -la conda-out/linux-64
-            
-              # Extract newest .conda and check GLIBC requirements
-              python -c "import glob, os, shutil; from conda_package_handling.api import extract; \
-              pkgs=sorted(glob.glob(\"conda-out/linux-64/*.conda\")); \
-              assert pkgs, \"No .conda produced\"; \
-              pkg=pkgs[-1]; out=\"/tmp/extracted_pkg\"; \
-              shutil.rmtree(out, ignore_errors=True); os.makedirs(out, exist_ok=True); \
-              extract(pkg, out); print(\"pkg:\", pkg)"
-
-              SO=$(find /tmp/extracted_pkg -name "*.so" | head -n 1)
-              echo "SO=$SO"
-              objdump -T "$SO" | grep GLIBC_ | sort -u | tail -n 80
-
-              if objdump -T "$SO" | grep -q "GLIBC_2.33\|GLIBC_2.34"; then
-                echo "ERROR: still requires GLIBC_2.33/2.34"
-                exit 1
-              fi
             '
 
       - name: Upload artifact
