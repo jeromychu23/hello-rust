@@ -23,6 +23,13 @@ jobs:
           channels: conda-forge,defaults
           channel-priority: strict
           activate-environment: build-env
+          conda-solver: classic
+
+      - name: Force classic solver
+        shell: bash -l {0}
+        run: |
+          conda config --set solver classic
+          conda info
 
       - name: Install build dependencies
         shell: bash -l {0}
