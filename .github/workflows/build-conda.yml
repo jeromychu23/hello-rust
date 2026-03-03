@@ -41,9 +41,21 @@ jobs:
         run: |
           conda build recipe -c conda-forge
 
+      - name: List built files
+        shell: bash -l {0}
+        run: |
+          echo "=== /usr/share/miniconda/conda-bld ==="
+          find /usr/share/miniconda/conda-bld -maxdepth 3 -type f | sort || true
+          echo "=== HOME conda-bld ==="
+          find ~/conda-bld -maxdepth 3 -type f | sort || true
+
       - name: Upload conda artifact
         uses: actions/upload-artifact@v4
         with:
           name: conda-linux-64
-          path: /usr/share/miniconda/envs/build-env/conda-bld/linux-64/*.conda
+          path: |
+            /usr/share/miniconda/conda-bld/linux-64/*.conda
+            /usr/share/miniconda/conda-bld/linux-64/*.tar.bz2
+            /home/runner/conda-bld/linux-64/*.conda
+            /home/runner/conda-bld/linux-64/*.tar.bz2
           if-no-files-found: error
