@@ -3,64 +3,32 @@ name: Build Conda Package
 on:
   push:
     branches: [main, master]
-    paths:
-      - "Cargo.toml"
-      - "Cargo.lock"
-      - "src/**"
-      - "pyproject.toml"
-      - "recipe/**"
-      - ".github/workflows/build-conda.yml"
   pull_request:
-    paths:
-      - "Cargo.toml"
-      - "Cargo.lock"
-      - "src/**"
-      - "pyproject.toml"
-      - "recipe/**"
-      - ".github/workflows/build-conda.yml"
   workflow_dispatch:
 
 jobs:
   build-conda:
     name: Build conda package on Linux
-    runs-on: ubuntu-22.04
-    env:
-      CONDA_PKGS_DIRS: /home/runner/conda_pkgs
+    runs-on: ubuntu-latest
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-
-      # Rust build cache (big win)
-      - name: Cache cargo
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-
 
       - name: Set up Miniconda
         uses: conda-incubator/setup-miniconda@v3
         with:
           auto-update-conda: false
           python-version: "3.11"
-          channels: conda-forge
+          channels: conda-forge,defaults
           channel-priority: strict
           activate-environment: build-env
           conda-solver: classic
 
-      - name: Configure conda network retries/timeouts
+      - name: Force classic solver
         shell: bash -l {0}
         run: |
           conda config --set solver classic
-          conda config --set remote_connect_timeout_secs 60
-          conda config --set remote_read_timeout_secs 300
-          conda config --set remote_max_retries 10
-          conda config --set remote_backoff_factor 2
           conda info
 
       - name: Install build dependencies
@@ -73,6 +41,12 @@ jobs:
         run: |
           mkdir -p $GITHUB_WORKSPACE/conda-out
           conda build recipe -c conda-forge --output-folder $GITHUB_WORKSPACE/conda-out
+
+      - name: List built files
+        shell: bash -l {0}
+        run: |
+          echo "=== conda-out ==="
+          find $GITHUB_WORKSPACE/conda-out -maxdepth 3 -type f | sort || true
 
       - name: Upload conda artifact
         uses: actions/upload-artifact@v4
