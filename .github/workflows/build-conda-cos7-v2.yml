@@ -1,0 +1,50 @@
+name: build-conda-cos7-v2
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build conda package in cos7 container
+        run: |
+          set -euo pipefail
+          docker run --rm \
+            -v "$PWD":/work -w /work \
+            condaforge/linux-anvil-cos7-x86_64 \
+            bash -lc '
+              set -euo pipefail
+
+              # NOTE: do NOT install conda-verify (image pins python 3.12.*; conda-verify conflicts)
+              mamba install -y conda-build boa conda-package-handling binutils -c conda-forge
+
+              conda mambabuild recipe -c conda-forge --output-folder conda-out
+              echo "== produced packages =="
+              ls -la conda-out/linux-64
+
+              # Extract newest .conda and check GLIBC requirements
+              python -c "import glob, os, shutil; from conda_package_handling.api import extract; \
+pkgs=sorted(glob.glob(\"conda-out/linux-64/*.conda\")); \
+assert pkgs, \"No .conda produced\"; \
+pkg=pkgs[-1]; out=\"/tmp/extracted_pkg\"; \
+shutil.rmtree(out, ignore_errors=True); os.makedirs(out, exist_ok=True); \
+extract(pkg, out); print(\"pkg:\", pkg)"
+
+              SO=$(find /tmp/extracted_pkg -name "*.so" | head -n 1)
+              echo "SO=$SO"
+              objdump -T "$SO" | grep GLIBC_ | sort -u | tail -n 80
+
+              if objdump -T "$SO" | grep -q "GLIBC_2.33\|GLIBC_2.34"; then
+                echo "ERROR: still requires GLIBC_2.33/2.34"
+                exit 1
+              fi
+            '
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: conda-out-linux-64
+          path: conda-out/linux-64/*.conda
