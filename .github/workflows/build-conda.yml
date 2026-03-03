@@ -3,7 +3,21 @@ name: Build Conda Package
 on:
   push:
     branches: [main, master]
+    paths:
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "src/**"
+      - "pyproject.toml"
+      - "recipe/**"
+      - ".github/workflows/build-conda.yml"
   pull_request:
+    paths:
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "src/**"
+      - "pyproject.toml"
+      - "recipe/**"
+      - ".github/workflows/build-conda.yml"
   workflow_dispatch:
 
 jobs:
@@ -15,6 +29,18 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      # Rust build cache (big win)
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
       - name: Set up Miniconda
         uses: conda-incubator/setup-miniconda@v3
         with:
@@ -25,28 +51,34 @@ jobs:
           activate-environment: build-env
           conda-solver: classic
 
-      - name: Force classic solver
+      # Put conda pkgs in a stable place we can cache
+      - name: Configure conda pkgs dir
         shell: bash -l {0}
         run: |
+          mkdir -p $HOME/conda_pkgs
+          conda config --set pkgs_dirs $HOME/conda_pkgs
           conda config --set solver classic
           conda info
+
+      - name: Cache conda packages
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/conda_pkgs
+          key: ${{ runner.os }}-conda-${{ hashFiles('recipe/meta.yaml') }}
+          restore-keys: |
+            ${{ runner.os }}-conda-
 
       - name: Install build dependencies
         shell: bash -l {0}
         run: |
-          conda install -y conda-build pip python=3.8 maturin rust
+          conda install -y conda-build pip python=3.11 maturin rust
 
       - name: Build conda package to fixed output folder
         shell: bash -l {0}
         run: |
           mkdir -p $GITHUB_WORKSPACE/conda-out
           conda build recipe -c conda-forge --output-folder $GITHUB_WORKSPACE/conda-out
-
-      - name: List built files
-        shell: bash -l {0}
-        run: |
-          echo "=== conda-out ==="
-          find $GITHUB_WORKSPACE/conda-out -maxdepth 3 -type f | sort || true
 
       - name: Upload conda artifact
         uses: actions/upload-artifact@v4
