@@ -9,7 +9,7 @@ source:
   path: ..
 
 build:
-  number: 0
+  number: 1
   script: {{ PYTHON }} -m pip install . -vv
 
 requirements:
@@ -17,11 +17,11 @@ requirements:
     - {{ compiler('c') }}
     - rust
   host:
-    - python 3.8.*
+    - python 3.9.*
     - pip
     - maturin >=1.0,<2.0
   run:
-    - python 3.8.*
+    - python >=3.9,<3.10
 
 test:
   imports:

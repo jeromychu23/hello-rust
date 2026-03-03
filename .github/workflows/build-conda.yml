@@ -19,7 +19,7 @@ jobs:
         uses: conda-incubator/setup-miniconda@v3
         with:
           auto-update-conda: false
-          python-version: "3.8"
+          python-version: "3.9"
           channels: conda-forge,defaults
           channel-priority: strict
           activate-environment: build-env
