@@ -1,23 +1,6 @@
 name: Build Conda Package
 
 on:
-  push:
-    branches: [main, master]
-    paths:
-      - "Cargo.toml"
-      - "Cargo.lock"
-      - "src/**"
-      - "pyproject.toml"
-      - "recipe/**"
-      - ".github/workflows/build-conda.yml"
-  pull_request:
-    paths:
-      - "Cargo.toml"
-      - "Cargo.lock"
-      - "src/**"
-      - "pyproject.toml"
-      - "recipe/**"
-      - ".github/workflows/build-conda.yml"
   workflow_dispatch:
 
 jobs:

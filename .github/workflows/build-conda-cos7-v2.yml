@@ -3,6 +3,22 @@ name: build-conda-cos7-v2
 on:
   push:
     branches: [ main ]
+    paths:
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "src/**"
+      - "pyproject.toml"
+      - "recipe/**"
+      - ".github/workflows/build-conda-cos7-v2.yml"
+  pull_request:
+    branches: [ main ]
+    paths:
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "src/**"
+      - "pyproject.toml"
+      - "recipe/**"
+      - ".github/workflows/build-conda-cos7-v2.yml"
   workflow_dispatch:
 
 jobs:
