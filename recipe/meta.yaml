@@ -1,5 +1,5 @@
 {% set name = "hello-rust" %}
-{% set version = "0.1.0" %}
+{% set version = "0.1.1" %}
 
 package:
   name: {{ name|lower }}
@@ -9,7 +9,7 @@ source:
   path: ..
 
 build:
-  number: 3
+  number: 1
   script: {{ PYTHON }} -m pip install . -vv
 
 requirements:
@@ -29,6 +29,7 @@ test:
   commands:
     - python -c "import hello_rust; assert hello_rust.add(2, 3) == 5"
     - python -c "import hello_rust; assert hasattr(hello_rust, 'pivot_by_prefix')"
+    - python -c "import hello_rust; assert hasattr(hello_rust, 'propagate_target_from_ancestor')"
 
 about:
   summary: "A tiny Rust extension for Python"
