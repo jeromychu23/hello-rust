@@ -76,7 +76,7 @@ jobs:
         shell: bash -l {0}
         run: |
           mkdir -p $GITHUB_WORKSPACE/conda-out
-          conda build recipe -c conda-forge --output-folder $GITHUB_WORKSPACE/conda-out
+          conda-build recipe -c conda-forge --output-folder $GITHUB_WORKSPACE/conda-out
 
       - name: Upload conda artifact
         uses: actions/upload-artifact@v4
