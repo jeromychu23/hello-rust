@@ -9,7 +9,7 @@ source:
   path: ..
 
 build:
-  number: 2
+  number: 3
   script: {{ PYTHON }} -m pip install . -vv
 
 requirements:
@@ -28,6 +28,7 @@ test:
     - hello_rust
   commands:
     - python -c "import hello_rust; assert hello_rust.add(2, 3) == 5"
+    - python -c "import hello_rust; assert hasattr(hello_rust, 'pivot_by_prefix')"
 
 about:
   summary: "A tiny Rust extension for Python"
