@@ -1,5 +1,5 @@
 {% set name = "hello-rust" %}
-{% set version = "0.1.1" %}
+{% set version = "0.1.2" %}
 
 package:
   name: {{ name|lower }}
@@ -22,6 +22,7 @@ requirements:
     - maturin >=1.0,<2.0
   run:
     - python 3.11.*
+    - polars
 
 test:
   imports:
@@ -30,6 +31,7 @@ test:
     - python -c "import hello_rust; assert hello_rust.add(2, 3) == 5"
     - python -c "import hello_rust; assert hasattr(hello_rust, 'pivot_by_prefix')"
     - python -c "import hello_rust; assert hasattr(hello_rust, 'propagate_target_from_ancestor')"
+    - python -c "import polars as pl, hello_rust; df=pl.DataFrame({'sn':['A'],'pn':['1'],'parent_sn':['B-58x'],'parent_pn':[''],'type':['Install'],'date':['2022-01-01T00:00:00.000Z']}); out=hello_rust.propagate_target_from_ancestor(df,['sn','pn'],['parent_sn','parent_pn'],'date',{'type':'Install'},{'parent_sn':'B-58'},'backward'); assert out.shape==(1,6)"
 
 about:
   summary: "A tiny Rust extension for Python"

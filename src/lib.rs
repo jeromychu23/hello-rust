@@ -59,6 +59,22 @@ fn pivot_by_prefix(
     Ok(result.unbind())
 }
 
+#[derive(Clone, Copy)]
+enum Plan {
+    Backward,
+    Forward,
+}
+
+fn parse_plan(plan: &str) -> PyResult<Plan> {
+    match plan {
+        "backward" => Ok(Plan::Backward),
+        "forward" => Ok(Plan::Forward),
+        _ => Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+            "plan must be either 'backward' or 'forward'",
+        )),
+    }
+}
+
 fn value_to_key(value: Option<Bound<'_, PyAny>>) -> PyResult<String> {
     match value {
         None => Ok("<missing>".to_string()),
@@ -95,17 +111,27 @@ fn matches_target_key(
     Ok(true)
 }
 
-fn choose_candidate(
+fn compare_bool(left: &Bound<'_, PyAny>, right: &Bound<'_, PyAny>, op: CompareOp) -> bool {
+    left.rich_compare(right, op)
+        .and_then(|result| result.is_truthy())
+        .unwrap_or(false)
+}
+
+fn is_valid_target(value: Option<Bound<'_, PyAny>>) -> bool {
+    match value {
+        None => false,
+        Some(v) => !v.is_none(),
+    }
+}
+
+fn choose_candidate_by_plan(
     py: Python<'_>,
     rows: &[Py<PyDict>],
     candidates: &[usize],
     target_col: &str,
-    start_target: Option<Bound<'_, PyAny>>,
-) -> PyResult<usize> {
-    let Some(start_target) = start_target else {
-        return Ok(candidates[0]);
-    };
-
+    ref_target: &Bound<'_, PyAny>,
+    plan: Plan,
+) -> PyResult<Option<usize>> {
     let mut best_idx: Option<usize> = None;
     let mut best_val: Option<Py<PyAny>> = None;
 
@@ -118,10 +144,11 @@ fn choose_candidate(
             continue;
         }
 
-        let ge = val
-            .rich_compare(&start_target, CompareOp::Ge)?
-            .is_truthy()?;
-        if !ge {
+        let in_direction = match plan {
+            Plan::Backward => compare_bool(&val, ref_target, CompareOp::Le),
+            Plan::Forward => compare_bool(&val, ref_target, CompareOp::Ge),
+        };
+        if !in_direction {
             continue;
         }
 
@@ -131,10 +158,11 @@ fn choose_candidate(
                 best_val = Some(val.unbind());
             }
             Some(current_best) => {
-                let is_lt = val
-                    .rich_compare(current_best.bind(py), CompareOp::Lt)?
-                    .is_truthy()?;
-                if is_lt {
+                let better = match plan {
+                    Plan::Backward => compare_bool(&val, current_best.bind(py), CompareOp::Gt),
+                    Plan::Forward => compare_bool(&val, current_best.bind(py), CompareOp::Lt),
+                };
+                if better {
                     best_idx = Some(*idx);
                     best_val = Some(val.unbind());
                 }
@@ -142,11 +170,18 @@ fn choose_candidate(
         }
     }
 
-    Ok(best_idx.unwrap_or(candidates[0]))
+    Ok(best_idx)
 }
 
-/// For each row, walk through parent links until a parent column starts with the configured prefix,
-/// then replace that row's target column with the matched ancestor row's target value.
+/// For each row, walk through parent links (single-path DFS over ancestor chain) until a parent
+/// column starts with the configured prefix, then replace that row's target column with the matched
+/// ancestor row's target value.
+///
+/// plan:
+/// - "backward": choose the nearest candidate with target_col <= current node target_col.
+/// - "forward": choose the nearest candidate with target_col >= current node target_col.
+///
+/// If no valid candidate is found, the original value is kept unchanged.
 #[pyfunction]
 fn propagate_target_from_ancestor(
     py: Python<'_>,
@@ -156,6 +191,7 @@ fn propagate_target_from_ancestor(
     target_col: String,
     target_key: HashMap<String, String>,
     para: HashMap<String, String>,
+    plan: String,
 ) -> PyResult<Py<PyAny>> {
     if self_cols.len() != parent_cols.len() {
         return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
@@ -168,6 +204,7 @@ fn propagate_target_from_ancestor(
         ));
     }
 
+    let plan = parse_plan(&plan)?;
     let (para_col, para_prefix) = para.iter().next().expect("checked len=1");
     let rows_list = df.call_method0("to_dicts")?.cast_into::<PyList>()?;
 
@@ -192,8 +229,15 @@ fn propagate_target_from_ancestor(
 
     for start_idx in active_indices {
         let start_row = rows[start_idx].bind(py);
-        let start_target = start_row.get_item(&target_col)?;
+        let Some(start_target) = start_row.get_item(&target_col)? else {
+            continue;
+        };
+        if !is_valid_target(Some(start_target.clone())) {
+            continue;
+        }
+
         let mut current_parent = composite_key(&start_row, &parent_cols)?;
+        let mut current_target = start_target;
         let mut visited = HashSet::new();
         let mut replacement: Option<Py<PyAny>> = None;
 
@@ -205,13 +249,26 @@ fn propagate_target_from_ancestor(
             let Some(candidates) = self_index.get(&current_parent) else {
                 break;
             };
-            if candidates.is_empty() {
+
+            let Some(chosen_idx) = choose_candidate_by_plan(
+                py,
+                &rows,
+                candidates,
+                &target_col,
+                &current_target,
+                plan,
+            )?
+            else {
+                break;
+            };
+
+            let candidate = rows[chosen_idx].bind(py);
+            let Some(candidate_target) = candidate.get_item(&target_col)? else {
+                break;
+            };
+            if !is_valid_target(Some(candidate_target.clone())) {
                 break;
             }
-
-            let chosen_idx =
-                choose_candidate(py, &rows, candidates, &target_col, start_target.clone())?;
-            let candidate = rows[chosen_idx].bind(py);
 
             let para_val = candidate
                 .get_item(para_col)?
@@ -220,11 +277,12 @@ fn propagate_target_from_ancestor(
                 .as_deref()
                 .is_some_and(|val| val.starts_with(para_prefix))
             {
-                replacement = candidate.get_item(&target_col)?.map(Bound::unbind);
+                replacement = Some(candidate_target.unbind());
                 break;
             }
 
             current_parent = composite_key(&candidate, &parent_cols)?;
+            current_target = candidate_target;
         }
 
         if let Some(new_value) = replacement {
