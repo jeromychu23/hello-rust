@@ -170,7 +170,7 @@ fn choose_candidate_by_plan(
     Ok(best_idx)
 }
 
-fn has_self_blocker_before_start(
+fn has_self_blocker_after_start(
     py: Python<'_>,
     rows: &[Py<PyDict>],
     self_index_all: &HashMap<String, Vec<usize>>,
@@ -201,7 +201,7 @@ fn has_self_blocker_before_start(
             continue;
         }
 
-        if compare_bool(&block_target, start_target, CompareOp::Le) {
+        if compare_bool(&block_target, start_target, CompareOp::Gt) {
             return Ok(true);
         }
     }
@@ -221,7 +221,7 @@ fn has_self_blocker_before_start(
 ///
 /// block_key:
 /// - Optional key/value matcher applied in two places:
-///   1) same-self history check: if the current self already has a blocker event at or before
+///   1) same-self history check: if the current self already has a blocker event after
 ///      this row's target_col, propagation is skipped for this row.
 ///   2) ancestor traversal: if a selected candidate matches block_key, traversal stops.
 /// - In both cases, the original target value remains unchanged.
@@ -268,7 +268,7 @@ fn propagate_target_rows(
 
         let start_self_key = composite_key(&start_row, self_cols)?;
         if let Some(kv) = block_key {
-            if has_self_blocker_before_start(
+            if has_self_blocker_after_start(
                 py,
                 rows,
                 &self_index_all,
@@ -417,8 +417,8 @@ mod tests {
                 [
                     ("id", "a3"),
                     ("parent_id", "a2"),
-                    ("event", "Install"),
-                    ("kind", "target"),
+                    ("event", "Remove"),
+                    ("kind", "other"),
                     ("ts", "3"),
                 ],
                 [
@@ -497,7 +497,7 @@ mod tests {
     }
 
     #[test]
-    fn self_history_blocker_prevents_propagation() {
+    fn self_history_future_blocker_prevents_propagation() {
         Python::attach(|py| {
             let rows: Vec<Py<PyDict>> = vec![
                 [
@@ -510,15 +510,15 @@ mod tests {
                 [
                     ("id", "leaf"),
                     ("parent_id", "parent"),
-                    ("event", "Remove"),
-                    ("kind", "other"),
+                    ("event", "Install"),
+                    ("kind", "target"),
                     ("ts", "2"),
                 ],
                 [
                     ("id", "leaf"),
                     ("parent_id", "parent"),
-                    ("event", "Install"),
-                    ("kind", "target"),
+                    ("event", "Remove"),
+                    ("kind", "other"),
                     ("ts", "3"),
                 ],
             ]
@@ -551,7 +551,7 @@ mod tests {
             )
             .expect("propagation with self-history blocker");
 
-            let leaf_install_ts: String = rows[2]
+            let leaf_install_ts: String = rows[1]
                 .bind(py)
                 .get_item("ts")
                 .expect("leaf install ts item")
