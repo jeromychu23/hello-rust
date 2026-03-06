@@ -103,7 +103,7 @@ A simplified event history:
 
 Challenge: Removal involved in the dataframe, without `block key` the install date will be set to `2026-01-01` which is unreasonable.
 
-### Output (After, with `block ley`)
+### Output (After, with `block key`)
 
 After DFS-like hierarchical evaluation:
 
