@@ -215,9 +215,11 @@ fn has_blocker_on_node_after_target(
 /// If no valid candidate is found, the original value is kept unchanged.
 ///
 /// block_key:
-/// - Optional key/value matcher applied at node level for the current parent chain.
-/// - For each parent node encountered during traversal (starting from this row's immediate
-///   parent), if that node has any blocker event with target_col > current reference target,
+/// - Optional key/value matcher applied at node level.
+/// - For each active row, blocker checking starts on the row's own self node first.
+/// - If not blocked on self node, blocker checking continues on ancestor parent nodes during
+///   traversal.
+/// - If any checked node has a blocker event with target_col > current reference target,
 ///   traversal is terminated.
 /// - In that case the original target value remains unchanged.
 fn propagate_target_rows(
@@ -261,6 +263,21 @@ fn propagate_target_rows(
             continue;
         }
         let anchor_target = start_target.clone();
+        let start_self = composite_key(&start_row, self_cols)?;
+
+        if let Some(kv) = block_key {
+            if has_blocker_on_node_after_target(
+                py,
+                rows,
+                &self_index_all,
+                &start_self,
+                &anchor_target,
+                target_col,
+                kv,
+            )? {
+                continue;
+            }
+        }
 
         let mut current_parent = composite_key(&start_row, parent_cols)?;
         let mut current_target = start_target;
@@ -491,7 +508,7 @@ mod tests {
     }
 
     #[test]
-    fn node_level_self_blocker_does_not_prevent_propagation() {
+    fn node_level_self_blocker_prevents_propagation() {
         Python::attach(|py| {
             let rows: Vec<Py<PyDict>> = vec![
                 [
@@ -544,6 +561,72 @@ mod tests {
                 Plan::Backward,
             )
             .expect("propagation with self-history blocker");
+
+            let leaf_install_ts: String = rows[1]
+                .bind(py)
+                .get_item("ts")
+                .expect("leaf install ts item")
+                .expect("leaf install ts exists")
+                .extract()
+                .expect("leaf install ts string");
+            assert_eq!(leaf_install_ts, "2");
+        });
+    }
+
+    #[test]
+    fn node_level_self_blocker_not_later_does_not_block() {
+        Python::attach(|py| {
+            let rows: Vec<Py<PyDict>> = vec![
+                [
+                    ("id", "parent"),
+                    ("parent_id", "root"),
+                    ("event", "Install"),
+                    ("kind", "target"),
+                    ("ts", "1"),
+                ],
+                [
+                    ("id", "leaf"),
+                    ("parent_id", "parent"),
+                    ("event", "Install"),
+                    ("kind", "target"),
+                    ("ts", "2"),
+                ],
+                [
+                    ("id", "leaf"),
+                    ("parent_id", "parent"),
+                    ("event", "Remove"),
+                    ("kind", "other"),
+                    ("ts", "1"),
+                ],
+            ]
+            .into_iter()
+            .map(|pairs| {
+                let d = PyDict::new(py);
+                for (k, v) in pairs {
+                    d.set_item(k, v).expect("set test item");
+                }
+                d.unbind()
+            })
+            .collect();
+
+            let self_cols = vec!["id".to_string()];
+            let parent_cols = vec!["parent_id".to_string()];
+            let target_key = HashMap::from([("kind".to_string(), "target".to_string())]);
+            let blocker = HashMap::from([("event".to_string(), "Remove".to_string())]);
+
+            propagate_target_rows(
+                py,
+                &rows,
+                &self_cols,
+                &parent_cols,
+                "ts",
+                &target_key,
+                Some(&blocker),
+                "event",
+                "Install",
+                Plan::Backward,
+            )
+            .expect("propagation with non-later self blocker");
 
             let leaf_install_ts: String = rows[1]
                 .bind(py)
