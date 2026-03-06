@@ -1,0 +1,42 @@
+name: Maturin Canary
+
+on:
+  schedule:
+    - cron: '0 3 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  canary:
+    name: canary-${{ matrix.platform.name }}
+    runs-on: ${{ matrix.platform.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        platform:
+          - name: linux-x86_64
+            runner: ubuntu-22.04
+            target: x86_64
+            manylinux: auto
+          - name: musllinux-x86_64
+            runner: ubuntu-22.04
+            target: x86_64
+            manylinux: musllinux_1_2
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.x'
+      - name: Build wheels with latest allowed maturin
+        uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.platform.target }}
+          args: --release --out dist --find-interpreter
+          manylinux: ${{ matrix.platform.manylinux }}
+      - name: Upload canary wheels
+        uses: actions/upload-artifact@v6
+        with:
+          name: canary-${{ matrix.platform.name }}
+          path: dist

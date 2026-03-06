@@ -24,6 +24,7 @@ jobs:
       - name: Build wheels with maturin
         uses: PyO3/maturin-action@v1
         with:
+          maturin-version: "1.12.5"
           command: build
           args: --release --interpreter python${{ matrix.python-version }}
           manylinux: auto
