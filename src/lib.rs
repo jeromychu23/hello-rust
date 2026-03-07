@@ -170,7 +170,7 @@ fn choose_candidate_by_plan(
     Ok(best_idx)
 }
 
-fn has_blocker_on_node_after_target(
+fn earliest_blocker_on_node_after_target(
     py: Python<'_>,
     rows: &[Py<PyDict>],
     self_index_all: &HashMap<String, Vec<usize>>,
@@ -178,10 +178,12 @@ fn has_blocker_on_node_after_target(
     ref_target: &Bound<'_, PyAny>,
     target_col: &str,
     block_key: &HashMap<String, String>,
-) -> PyResult<bool> {
+) -> PyResult<Option<Py<PyAny>>> {
     let Some(indices) = self_index_all.get(node_key) else {
-        return Ok(false);
+        return Ok(None);
     };
+
+    let mut earliest: Option<Py<PyAny>> = None;
 
     for idx in indices {
         let row = rows[*idx].bind(py);
@@ -196,12 +198,20 @@ fn has_blocker_on_node_after_target(
             continue;
         }
 
-        if compare_bool(&block_target, ref_target, CompareOp::Gt) {
-            return Ok(true);
+        if !compare_bool(&block_target, ref_target, CompareOp::Gt) {
+            continue;
+        }
+
+        let should_take = match &earliest {
+            None => true,
+            Some(current) => compare_bool(&block_target, current.bind(py), CompareOp::Lt),
+        };
+        if should_take {
+            earliest = Some(block_target.unbind());
         }
     }
 
-    Ok(false)
+    Ok(earliest)
 }
 
 /// For each row, walk through parent links (single-path DFS over ancestor chain) until a parent
@@ -216,12 +226,12 @@ fn has_blocker_on_node_after_target(
 ///
 /// block_key:
 /// - Optional key/value matcher applied at node level.
-/// - For each active row, blocker checking starts on the row's own self node first.
-/// - If not blocked on self node, blocker checking continues on ancestor parent nodes during
-///   traversal.
-/// - If any checked node has a blocker event with target_col > current reference target,
-///   traversal is terminated.
-/// - In that case the original target value remains unchanged.
+/// - For each active row, blocker search starts on self node and continues on traversed
+///   parent nodes.
+/// - Blockers are filtered by target_col > anchor target, then the earliest blocker among
+///   visited nodes is tracked.
+/// - Before accepting a matched target candidate, compare candidate target_col vs blocker:
+///   if target is earlier than blocker, keep target; otherwise break and keep original value.
 fn propagate_target_rows(
     py: Python<'_>,
     rows: &[Py<PyDict>],
@@ -264,9 +274,10 @@ fn propagate_target_rows(
         }
         let anchor_target = start_target.clone();
         let start_self = composite_key(&start_row, self_cols)?;
+        let mut earliest_blocker: Option<Py<PyAny>> = None;
 
         if let Some(kv) = block_key {
-            if has_blocker_on_node_after_target(
+            if let Some(blocker) = earliest_blocker_on_node_after_target(
                 py,
                 rows,
                 &self_index_all,
@@ -275,7 +286,7 @@ fn propagate_target_rows(
                 target_col,
                 kv,
             )? {
-                continue;
+                earliest_blocker = Some(blocker);
             }
         }
 
@@ -290,7 +301,7 @@ fn propagate_target_rows(
             }
 
             if let Some(kv) = block_key {
-                if has_blocker_on_node_after_target(
+                if let Some(node_blocker) = earliest_blocker_on_node_after_target(
                     py,
                     rows,
                     &self_index_all,
@@ -299,7 +310,15 @@ fn propagate_target_rows(
                     target_col,
                     kv,
                 )? {
-                    break;
+                    let should_take = match &earliest_blocker {
+                        None => true,
+                        Some(current) => {
+                            compare_bool(node_blocker.bind(py), current.bind(py), CompareOp::Lt)
+                        }
+                    };
+                    if should_take {
+                        earliest_blocker = Some(node_blocker);
+                    }
                 }
             }
 
@@ -321,12 +340,6 @@ fn propagate_target_rows(
                 break;
             }
 
-            if let Some(kv) = block_key {
-                if matches_kv(&candidate, kv)? {
-                    break;
-                }
-            }
-
             let para_val = candidate
                 .get_item(para_col)?
                 .and_then(|x| x.extract::<String>().ok());
@@ -334,7 +347,15 @@ fn propagate_target_rows(
                 .as_deref()
                 .is_some_and(|val| val.starts_with(para_prefix))
             {
-                replacement = Some(candidate_target.unbind());
+                let target_before_block = match &earliest_blocker {
+                    None => true,
+                    Some(blocker_target) => {
+                        compare_bool(&candidate_target, blocker_target.bind(py), CompareOp::Lt)
+                    }
+                };
+                if target_before_block {
+                    replacement = Some(candidate_target.unbind());
+                }
                 break;
             }
 

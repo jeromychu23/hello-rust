@@ -12,16 +12,33 @@ def _normalize(df: pl.DataFrame) -> pl.DataFrame:
 def test_propagate_target_from_ancestor_from_local_csv() -> None:
     csv_path = Path(__file__).parent / "data" / "pivot_input.csv"
     source_df = pl.read_csv(csv_path, try_parse_dates=False)
+    
+    source_df = (
+        source_df
+        .with_columns(pl.col("date").alias("install_date"))
+        .with_columns(pl.col("date").alias("remove_date"))
+    )
 
     result_df = hello_rust.propagate_target_from_ancestor(
         source_df,
         self_cols=["id"],
         parent_cols=["parent_id"],
-        target_col="date",
+        target_col="install_date",
         target_key={"event": "Install"},
         para={"parent_id": "parent0"},
         plan="forward",
         block_key={"event": "Remove"},
+    )
+    
+    result_df = hello_rust.propagate_target_from_ancestor(
+        result_df,
+        self_cols=["id"],
+        parent_cols=["parent_id"],
+        target_col="remove_date",
+        target_key={"event": "Remove"},
+        para={"event": "Remove"},
+        plan="backward",
+        block_key={"event": "Install"},
     )
 
     # expected_df = source_df.with_columns(
@@ -41,3 +58,4 @@ def test_propagate_target_from_ancestor_from_local_csv() -> None:
     #     print(expected_df.to_dicts())
 
     # compare removed for now; print output only
+    # test command .\.venv\Scripts\python -m pytest -s -q test/test_polars.py
