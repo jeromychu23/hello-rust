@@ -75,27 +75,11 @@ fn parse_plan(plan: &str) -> PyResult<Plan> {
     }
 }
 
-fn value_to_key(value: Option<Bound<'_, PyAny>>) -> PyResult<String> {
-    match value {
-        None => Ok("<missing>".to_string()),
-        Some(v) if v.is_none() => Ok("<none>".to_string()),
-        Some(v) => {
-            if let Ok(s) = v.extract::<String>() {
-                Ok(format!("S:{s}"))
-            } else {
-                Ok(format!("R:{}", v.str()?))
-            }
-        }
-    }
-}
-
-fn composite_key(row: &Bound<'_, PyDict>, cols: &[String]) -> PyResult<String> {
-    let mut parts = Vec::with_capacity(cols.len());
-    for col in cols {
-        let val = row.get_item(col)?;
-        parts.push(value_to_key(val)?);
-    }
-    Ok(parts.join("\u{1F}"))
+fn key_from_row(row: &Bound<'_, PyDict>, key_col: &str) -> PyResult<String> {
+    let value = row.get_item(key_col)?.ok_or_else(|| {
+        PyErr::new::<pyo3::exceptions::PyKeyError, _>(format!("missing key column: {key_col}"))
+    })?;
+    value.extract::<String>()
 }
 
 fn matches_kv(row: &Bound<'_, PyDict>, kv_map: &HashMap<String, String>) -> PyResult<bool> {
@@ -235,8 +219,8 @@ fn earliest_blocker_on_node_after_target(
 fn propagate_target_rows(
     py: Python<'_>,
     rows: &[Py<PyDict>],
-    self_cols: &[String],
-    parent_cols: &[String],
+    self_key_col: &str,
+    parent_key_col: &str,
     target_col: &str,
     target_key: &HashMap<String, String>,
     block_key: Option<&HashMap<String, String>>,
@@ -246,7 +230,7 @@ fn propagate_target_rows(
 ) -> PyResult<()> {
     let mut self_index_all: HashMap<String, Vec<usize>> = HashMap::new();
     for (i, row) in rows.iter().enumerate() {
-        let key = composite_key(&row.bind(py), self_cols)?;
+        let key = key_from_row(&row.bind(py), self_key_col)?;
         self_index_all.entry(key).or_default().push(i);
     }
 
@@ -260,7 +244,7 @@ fn propagate_target_rows(
     let mut self_index: HashMap<String, Vec<usize>> = HashMap::new();
     for i in &active_indices {
         let row = rows[*i].bind(py);
-        let key = composite_key(&row, self_cols)?;
+        let key = key_from_row(&row, self_key_col)?;
         self_index.entry(key).or_default().push(*i);
     }
 
@@ -273,7 +257,7 @@ fn propagate_target_rows(
             continue;
         }
         let anchor_target = start_target.clone();
-        let start_self = composite_key(&start_row, self_cols)?;
+        let start_self = key_from_row(&start_row, self_key_col)?;
         let mut earliest_blocker: Option<Py<PyAny>> = None;
 
         if let Some(kv) = block_key {
@@ -290,7 +274,7 @@ fn propagate_target_rows(
             }
         }
 
-        let mut current_parent = composite_key(&start_row, parent_cols)?;
+        let mut current_parent = key_from_row(&start_row, parent_key_col)?;
         let mut current_target = start_target;
         let mut visited = HashSet::new();
         let mut replacement: Option<Py<PyAny>> = None;
@@ -359,7 +343,7 @@ fn propagate_target_rows(
                 break;
             }
 
-            current_parent = composite_key(&candidate, parent_cols)?;
+            current_parent = key_from_row(&candidate, parent_key_col)?;
             current_target = candidate_target;
         }
 
@@ -399,7 +383,44 @@ fn propagate_target_from_ancestor(
 
     let plan = parse_plan(&plan)?;
     let (para_col, para_prefix) = para.iter().next().expect("checked len=1");
-    let rows_list = df.call_method0("to_dicts")?.cast_into::<PyList>()?;
+    let pl = py.import("polars")?;
+
+    let build_key_expr = |cols: &[String]| -> PyResult<Py<PyAny>> {
+        let exprs = PyList::empty(py);
+        for col in cols {
+            let expr = pl
+                .getattr("col")?
+                .call1((col.as_str(),))?
+                .call_method1("cast", (pl.getattr("String")?,))?
+                .call_method1("fill_null", ("<null>",))?;
+            exprs.append(expr)?;
+        }
+        let kwargs = PyDict::new(py);
+        kwargs.set_item("separator", "##")?;
+        let key_expr = pl.getattr("concat_str")?.call((exprs,), Some(&kwargs))?;
+        Ok(key_expr.unbind())
+    };
+
+    let self_key_col = "__self_key";
+    let parent_key_col = "__parent_key";
+
+    let self_key_expr = build_key_expr(&self_cols)?
+        .bind(py)
+        .call_method1("alias", (self_key_col,))?
+        .unbind();
+    let parent_key_expr = build_key_expr(&parent_cols)?
+        .bind(py)
+        .call_method1("alias", (parent_key_col,))?
+        .unbind();
+
+    let key_exprs = PyList::empty(py);
+    key_exprs.append(self_key_expr.bind(py))?;
+    key_exprs.append(parent_key_expr.bind(py))?;
+
+    let df_with_keys = df.call_method1("with_columns", (key_exprs,))?;
+    let rows_list = df_with_keys
+        .call_method0("to_dicts")?
+        .cast_into::<PyList>()?;
 
     let mut rows: Vec<Py<PyDict>> = Vec::with_capacity(rows_list.len());
     for item in rows_list.iter() {
@@ -409,8 +430,8 @@ fn propagate_target_from_ancestor(
     propagate_target_rows(
         py,
         &rows,
-        &self_cols,
-        &parent_cols,
+        self_key_col,
+        parent_key_col,
         target_col.as_str(),
         &target_key,
         block_key.as_ref(),
@@ -419,8 +440,8 @@ fn propagate_target_from_ancestor(
         plan,
     )?;
 
-    let pl = py.import("polars")?;
     let result = pl.getattr("DataFrame")?.call1((rows_list,))?;
+    let result = result.call_method1("drop", ((self_key_col, parent_key_col),))?;
     Ok(result.unbind())
 }
 
@@ -428,51 +449,68 @@ fn propagate_target_from_ancestor(
 mod tests {
     use super::*;
 
-    #[test]
-    fn blocker_terminates_chain_resolution() {
-        Python::attach(|py| {
-            let rows: Vec<Py<PyDict>> = vec![
-                [
-                    ("id", "a1"),
-                    ("parent_id", "root"),
-                    ("event", "Install"),
-                    ("kind", "target"),
-                    ("ts", "1"),
-                ],
-                [
-                    ("id", "a2"),
-                    ("parent_id", "a1"),
-                    ("event", "Remove"),
-                    ("kind", "target"),
-                    ("ts", "2"),
-                ],
-                [
-                    ("id", "a3"),
-                    ("parent_id", "a2"),
-                    ("event", "Remove"),
-                    ("kind", "other"),
-                    ("ts", "3"),
-                ],
-                [
-                    ("id", "leaf"),
-                    ("parent_id", "a3"),
-                    ("event", "Other"),
-                    ("kind", "target"),
-                    ("ts", "4"),
-                ],
-            ]
+    fn rows_with_keys(py: Python<'_>, rows_data: Vec<[(&str, &str); 5]>) -> Vec<Py<PyDict>> {
+        rows_data
             .into_iter()
             .map(|pairs| {
                 let d = PyDict::new(py);
+                let mut id_val: Option<&str> = None;
+                let mut parent_val: Option<&str> = None;
                 for (k, v) in pairs {
+                    if k == "id" {
+                        id_val = Some(v);
+                    }
+                    if k == "parent_id" {
+                        parent_val = Some(v);
+                    }
                     d.set_item(k, v).expect("set test item");
                 }
+                d.set_item("__self_key", id_val.expect("id exists"))
+                    .expect("set self key");
+                d.set_item("__parent_key", parent_val.expect("parent_id exists"))
+                    .expect("set parent key");
                 d.unbind()
             })
-            .collect();
+            .collect()
+    }
 
-            let self_cols = vec!["id".to_string()];
-            let parent_cols = vec!["parent_id".to_string()];
+    #[test]
+    fn blocker_terminates_chain_resolution() {
+        Python::attach(|py| {
+            let rows: Vec<Py<PyDict>> = rows_with_keys(
+                py,
+                vec![
+                    [
+                        ("id", "a1"),
+                        ("parent_id", "root"),
+                        ("event", "Install"),
+                        ("kind", "target"),
+                        ("ts", "1"),
+                    ],
+                    [
+                        ("id", "a2"),
+                        ("parent_id", "a1"),
+                        ("event", "Remove"),
+                        ("kind", "target"),
+                        ("ts", "2"),
+                    ],
+                    [
+                        ("id", "a3"),
+                        ("parent_id", "a2"),
+                        ("event", "Remove"),
+                        ("kind", "other"),
+                        ("ts", "3"),
+                    ],
+                    [
+                        ("id", "leaf"),
+                        ("parent_id", "a3"),
+                        ("event", "Other"),
+                        ("kind", "target"),
+                        ("ts", "4"),
+                    ],
+                ],
+            );
+
             let target_key = HashMap::from([("kind".to_string(), "target".to_string())]);
             let para_col = "event";
             let para_prefix = "Install";
@@ -480,8 +518,8 @@ mod tests {
             propagate_target_rows(
                 py,
                 &rows,
-                &self_cols,
-                &parent_cols,
+                "__self_key",
+                "__parent_key",
                 "ts",
                 &target_key,
                 None,
@@ -506,8 +544,8 @@ mod tests {
             propagate_target_rows(
                 py,
                 &rows,
-                &self_cols,
-                &parent_cols,
+                "__self_key",
+                "__parent_key",
                 "ts",
                 &target_key,
                 Some(&blocker),
@@ -531,49 +569,41 @@ mod tests {
     #[test]
     fn node_level_self_blocker_prevents_propagation() {
         Python::attach(|py| {
-            let rows: Vec<Py<PyDict>> = vec![
-                [
-                    ("id", "parent"),
-                    ("parent_id", "root"),
-                    ("event", "Install"),
-                    ("kind", "target"),
-                    ("ts", "1"),
+            let rows: Vec<Py<PyDict>> = rows_with_keys(
+                py,
+                vec![
+                    [
+                        ("id", "parent"),
+                        ("parent_id", "root"),
+                        ("event", "Install"),
+                        ("kind", "target"),
+                        ("ts", "1"),
+                    ],
+                    [
+                        ("id", "leaf"),
+                        ("parent_id", "parent"),
+                        ("event", "Install"),
+                        ("kind", "target"),
+                        ("ts", "2"),
+                    ],
+                    [
+                        ("id", "leaf"),
+                        ("parent_id", "parent"),
+                        ("event", "Remove"),
+                        ("kind", "other"),
+                        ("ts", "3"),
+                    ],
                 ],
-                [
-                    ("id", "leaf"),
-                    ("parent_id", "parent"),
-                    ("event", "Install"),
-                    ("kind", "target"),
-                    ("ts", "2"),
-                ],
-                [
-                    ("id", "leaf"),
-                    ("parent_id", "parent"),
-                    ("event", "Remove"),
-                    ("kind", "other"),
-                    ("ts", "3"),
-                ],
-            ]
-            .into_iter()
-            .map(|pairs| {
-                let d = PyDict::new(py);
-                for (k, v) in pairs {
-                    d.set_item(k, v).expect("set test item");
-                }
-                d.unbind()
-            })
-            .collect();
+            );
 
-            let self_cols = vec!["id".to_string()];
-            let parent_cols = vec!["parent_id".to_string()];
             let target_key = HashMap::from([("kind".to_string(), "target".to_string())]);
             let blocker = HashMap::from([("event".to_string(), "Remove".to_string())]);
 
             propagate_target_rows(
                 py,
                 &rows,
-                &self_cols,
-                &parent_cols,
+                "__self_key",
+                "__parent_key",
                 "ts",
                 &target_key,
                 Some(&blocker),
@@ -597,49 +627,41 @@ mod tests {
     #[test]
     fn node_level_self_blocker_not_later_does_not_block() {
         Python::attach(|py| {
-            let rows: Vec<Py<PyDict>> = vec![
-                [
-                    ("id", "parent"),
-                    ("parent_id", "root"),
-                    ("event", "Install"),
-                    ("kind", "target"),
-                    ("ts", "1"),
+            let rows: Vec<Py<PyDict>> = rows_with_keys(
+                py,
+                vec![
+                    [
+                        ("id", "parent"),
+                        ("parent_id", "root"),
+                        ("event", "Install"),
+                        ("kind", "target"),
+                        ("ts", "1"),
+                    ],
+                    [
+                        ("id", "leaf"),
+                        ("parent_id", "parent"),
+                        ("event", "Install"),
+                        ("kind", "target"),
+                        ("ts", "2"),
+                    ],
+                    [
+                        ("id", "leaf"),
+                        ("parent_id", "parent"),
+                        ("event", "Remove"),
+                        ("kind", "other"),
+                        ("ts", "1"),
+                    ],
                 ],
-                [
-                    ("id", "leaf"),
-                    ("parent_id", "parent"),
-                    ("event", "Install"),
-                    ("kind", "target"),
-                    ("ts", "2"),
-                ],
-                [
-                    ("id", "leaf"),
-                    ("parent_id", "parent"),
-                    ("event", "Remove"),
-                    ("kind", "other"),
-                    ("ts", "1"),
-                ],
-            ]
-            .into_iter()
-            .map(|pairs| {
-                let d = PyDict::new(py);
-                for (k, v) in pairs {
-                    d.set_item(k, v).expect("set test item");
-                }
-                d.unbind()
-            })
-            .collect();
+            );
 
-            let self_cols = vec!["id".to_string()];
-            let parent_cols = vec!["parent_id".to_string()];
             let target_key = HashMap::from([("kind".to_string(), "target".to_string())]);
             let blocker = HashMap::from([("event".to_string(), "Remove".to_string())]);
 
             propagate_target_rows(
                 py,
                 &rows,
-                &self_cols,
-                &parent_cols,
+                "__self_key",
+                "__parent_key",
                 "ts",
                 &target_key,
                 Some(&blocker),
@@ -663,56 +685,48 @@ mod tests {
     #[test]
     fn node_level_parent_blocker_prevents_propagation() {
         Python::attach(|py| {
-            let rows: Vec<Py<PyDict>> = vec![
-                [
-                    ("id", "ancestor"),
-                    ("parent_id", "root"),
-                    ("event", "Install"),
-                    ("kind", "target"),
-                    ("ts", "9"),
+            let rows: Vec<Py<PyDict>> = rows_with_keys(
+                py,
+                vec![
+                    [
+                        ("id", "ancestor"),
+                        ("parent_id", "root"),
+                        ("event", "Install"),
+                        ("kind", "target"),
+                        ("ts", "9"),
+                    ],
+                    [
+                        ("id", "parent"),
+                        ("parent_id", "ancestor"),
+                        ("event", "Install"),
+                        ("kind", "target"),
+                        ("ts", "8"),
+                    ],
+                    [
+                        ("id", "parent"),
+                        ("parent_id", "ancestor"),
+                        ("event", "Remove"),
+                        ("kind", "other"),
+                        ("ts", "10"),
+                    ],
+                    [
+                        ("id", "leaf"),
+                        ("parent_id", "parent"),
+                        ("event", "Install"),
+                        ("kind", "target"),
+                        ("ts", "7"),
+                    ],
                 ],
-                [
-                    ("id", "parent"),
-                    ("parent_id", "ancestor"),
-                    ("event", "Install"),
-                    ("kind", "target"),
-                    ("ts", "8"),
-                ],
-                [
-                    ("id", "parent"),
-                    ("parent_id", "ancestor"),
-                    ("event", "Remove"),
-                    ("kind", "other"),
-                    ("ts", "10"),
-                ],
-                [
-                    ("id", "leaf"),
-                    ("parent_id", "parent"),
-                    ("event", "Install"),
-                    ("kind", "target"),
-                    ("ts", "7"),
-                ],
-            ]
-            .into_iter()
-            .map(|pairs| {
-                let d = PyDict::new(py);
-                for (k, v) in pairs {
-                    d.set_item(k, v).expect("set test item");
-                }
-                d.unbind()
-            })
-            .collect();
+            );
 
-            let self_cols = vec!["id".to_string()];
-            let parent_cols = vec!["parent_id".to_string()];
             let target_key = HashMap::from([("kind".to_string(), "target".to_string())]);
             let blocker = HashMap::from([("event".to_string(), "Remove".to_string())]);
 
             propagate_target_rows(
                 py,
                 &rows,
-                &self_cols,
-                &parent_cols,
+                "__self_key",
+                "__parent_key",
                 "ts",
                 &target_key,
                 Some(&blocker),
@@ -736,63 +750,55 @@ mod tests {
     #[test]
     fn blocker_checks_use_start_target_as_anchor_across_ancestors() {
         Python::attach(|py| {
-            let rows: Vec<Py<PyDict>> = vec![
-                [
-                    ("id", "gp"),
-                    ("parent_id", "root"),
-                    ("event", "Install"),
-                    ("kind", "target"),
-                    ("ts", "2022-01-01T00:00:00.000Z"),
+            let rows: Vec<Py<PyDict>> = rows_with_keys(
+                py,
+                vec![
+                    [
+                        ("id", "gp"),
+                        ("parent_id", "root"),
+                        ("event", "Install"),
+                        ("kind", "target"),
+                        ("ts", "2022-01-01T00:00:00.000Z"),
+                    ],
+                    [
+                        ("id", "gp"),
+                        ("parent_id", "root"),
+                        ("event", "Remove"),
+                        ("kind", "other"),
+                        ("ts", "2023-08-01T00:00:00.000Z"),
+                    ],
+                    [
+                        ("id", "p"),
+                        ("parent_id", "gp"),
+                        ("event", "Other"),
+                        ("kind", "target"),
+                        ("ts", "2023-07-15T12:03:00.000Z"),
+                    ],
+                    [
+                        ("id", "p"),
+                        ("parent_id", "gp"),
+                        ("event", "Remove"),
+                        ("kind", "other"),
+                        ("ts", "2023-07-15T12:00:00.000Z"),
+                    ],
+                    [
+                        ("id", "leaf"),
+                        ("parent_id", "p"),
+                        ("event", "Other"),
+                        ("kind", "target"),
+                        ("ts", "2024-02-05T16:30:00.000Z"),
+                    ],
                 ],
-                [
-                    ("id", "gp"),
-                    ("parent_id", "root"),
-                    ("event", "Remove"),
-                    ("kind", "other"),
-                    ("ts", "2023-08-01T00:00:00.000Z"),
-                ],
-                [
-                    ("id", "p"),
-                    ("parent_id", "gp"),
-                    ("event", "Other"),
-                    ("kind", "target"),
-                    ("ts", "2023-07-15T12:03:00.000Z"),
-                ],
-                [
-                    ("id", "p"),
-                    ("parent_id", "gp"),
-                    ("event", "Remove"),
-                    ("kind", "other"),
-                    ("ts", "2023-07-15T12:00:00.000Z"),
-                ],
-                [
-                    ("id", "leaf"),
-                    ("parent_id", "p"),
-                    ("event", "Other"),
-                    ("kind", "target"),
-                    ("ts", "2024-02-05T16:30:00.000Z"),
-                ],
-            ]
-            .into_iter()
-            .map(|pairs| {
-                let d = PyDict::new(py);
-                for (k, v) in pairs {
-                    d.set_item(k, v).expect("set test item");
-                }
-                d.unbind()
-            })
-            .collect();
+            );
 
-            let self_cols = vec!["id".to_string()];
-            let parent_cols = vec!["parent_id".to_string()];
             let target_key = HashMap::from([("kind".to_string(), "target".to_string())]);
             let blocker = HashMap::from([("event".to_string(), "Remove".to_string())]);
 
             propagate_target_rows(
                 py,
                 &rows,
-                &self_cols,
-                &parent_cols,
+                "__self_key",
+                "__parent_key",
                 "ts",
                 &target_key,
                 Some(&blocker),
