@@ -15,7 +15,7 @@ def test_propagate_target_from_ancestor_from_local_csv() -> None:
         .with_columns(pl.col("date").alias("remove_date"))
     )
 
-    result_df = hello_rust.propagate_target_from_ancestor(
+    result_df = hello_rust.propagate_target_from_ancestor( # type: ignore
         source_df,
         self_cols=["id"],
         parent_cols=["parent_id"],
@@ -26,7 +26,7 @@ def test_propagate_target_from_ancestor_from_local_csv() -> None:
         block_key={"event": "Remove"},
     )
     
-    result_df = hello_rust.propagate_target_from_ancestor(
+    result_df = hello_rust.propagate_target_from_ancestor( # type: ignore
         result_df,
         self_cols=["id"],
         parent_cols=["parent_id"],

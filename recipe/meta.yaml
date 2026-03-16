@@ -1,5 +1,5 @@
 {% set name = "hello-rust" %}
-{% set version = "0.1.5" %}
+{% set version = "0.1.6" %}
 
 package:
   name: {{ name|lower }}
@@ -28,10 +28,9 @@ test:
   imports:
     - hello_rust
   commands:
-    - python -c "import hello_rust; assert hello_rust.add(2, 3) == 5"
     - python -c "import hello_rust; assert hasattr(hello_rust, 'pivot_by_prefix')"
-    - python -c "import hello_rust; assert hasattr(hello_rust, 'propagate_target_from_ancestor')"
-    - python -c "import polars as pl, hello_rust; df=pl.DataFrame({'SERIAL':['A'],'PART':['1'],'PARENTSERIAL':['B-58x'],'PARENTPART':[''],'TRXTYPE':['Install'],'new_date':['2022-01-01T00:00:00.000Z']}); out=hello_rust.propagate_target_from_ancestor(df=df,self_cols=['SERIAL','PART'],parent_cols=['PARENTSERIAL','PARENTPART'],target_col='new_date',target_key={'TRXTYPE':'Install'},para={'PARENTSERIAL':'B-58'},plan='backward',block_key={'TRXTYPE':'Remove'}); assert out.shape==(1,6)"
+    - python -c "import hello_rust; assert hasattr(hello_rust, 'find_target_value_from_ancestor')"
+    - python -c "import polars as pl, hello_rust; df=pl.DataFrame({'SERIAL':['A'],'PART':['1'],'PARENTSERIAL':['B-58x'],'PARENTPART':[''],'TRXTYPE':['Install'],'new_date':['2022-01-01T00:00:00.000Z']}); out=hello_rust.find_target_value_from_ancestor(df=df,self_cols=['SERIAL','PART'],parent_cols=['PARENTSERIAL','PARENTPART'],target_col='new_date',target_key={'TRXTYPE':'Install'},stop_point={'PARENTSERIAL':'B-58'},plan='backward',block_key={'TRXTYPE':'Remove'}); assert out.shape==(1,6)"
 
 about:
   summary: "A tiny Rust extension for Python"
