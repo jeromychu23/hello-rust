@@ -3,11 +3,6 @@ use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 use std::collections::{HashMap, HashSet};
 
-#[pyfunction]
-fn add(a: i64, b: i64) -> PyResult<i64> {
-    Ok(a + b)
-}
-
 /// Pivot a long-form dataframe into one row per group with one output column per prefix.
 ///
 /// Parameters
@@ -32,13 +27,47 @@ fn pivot_by_prefix(
     py: Python<'_>,
     df: &Bound<'_, PyAny>,
     group_cols: Vec<String>,
-    target_col: String,
     prefixes: Vec<String>,
     key_col: String,
+    target_col: String,
 ) -> PyResult<Py<PyAny>> {
     let pl = py.import("polars")?;
-    let exprs = PyList::empty(py);
+    let cycle_start = prefixes[0].clone();
+    let sort_key = PyList::empty(py);
+    for col in &group_cols {
+        sort_key.append(col)?;
+    }
+    sort_key.append(target_col.as_str())?;
+    let sorted_df = df.call_method1("sort", (sort_key,))?;
 
+    // 2. 建立 cycle flag:
+    // (pl.col(key_col) == pl.lit(cycle_start)).cast(pl.Int64)
+    let key_expr = pl.getattr("col")?.call1((key_col.as_str(),))?;
+    let cycle_lit = pl.getattr("lit")?.call1((cycle_start.as_str(),))?;
+    let cycle_flag = key_expr
+        .call_method1("eq", (cycle_lit,))?
+        .call_method1("cast", (pl.getattr("Int64")?,))?;
+    let over_cols = PyList::empty(py);
+    for col in &group_cols {
+        over_cols.append(col)?;
+    }
+
+    let cycle_expr = cycle_flag
+        .call_method0("cum_sum")?
+        .call_method1("over", (over_cols,))?
+        .call_method1("alias", ("_cycle_id",))?;
+    let with_expr = PyList::empty(py);
+    with_expr.append(cycle_expr)?;
+
+    let working_df = sorted_df.call_method1("with_columns", (with_expr,))?;
+
+    let new_group_cols = PyList::empty(py);
+    for col in &group_cols {
+        new_group_cols.append(col)?;
+    }
+    let _ = new_group_cols.append("_cycle_id");
+
+    let exprs = PyList::empty(py);
     for prefix in prefixes {
         let target_expr = pl.getattr("col")?.call1((target_col.as_str(),))?;
         let key_expr = pl.getattr("col")?.call1((key_col.as_str(),))?;
@@ -53,8 +82,7 @@ fn pivot_by_prefix(
 
         exprs.append(agg_expr)?;
     }
-
-    let grouped = df.call_method1("group_by", (group_cols,))?;
+    let grouped = working_df.call_method1("group_by", (new_group_cols,))?;
     let result = grouped.call_method1("agg", (exprs,))?;
     Ok(result.unbind())
 }
@@ -65,6 +93,7 @@ enum Plan {
     Forward,
 }
 
+// 判斷要用哪個plan
 fn parse_plan(plan: &str) -> PyResult<Plan> {
     match plan {
         "backward" => Ok(Plan::Backward),
@@ -216,7 +245,7 @@ fn earliest_blocker_on_node_after_target(
 ///   visited nodes is tracked.
 /// - Before accepting a matched target candidate, compare candidate target_col vs blocker:
 ///   if target is earlier than blocker, keep target; otherwise break and keep original value.
-fn propagate_target_rows(
+fn find_target_rows(
     py: Python<'_>,
     rows: &[Py<PyDict>],
     self_key_col: &str,
@@ -224,8 +253,8 @@ fn propagate_target_rows(
     target_col: &str,
     target_key: &HashMap<String, String>,
     block_key: Option<&HashMap<String, String>>,
-    para_col: &str,
-    para_prefix: &str,
+    stop_col: &str,
+    stop_val: &str,
     plan: Plan,
 ) -> PyResult<()> {
     let mut self_index_all: HashMap<String, Vec<usize>> = HashMap::new();
@@ -325,11 +354,11 @@ fn propagate_target_rows(
             }
 
             let para_val = candidate
-                .get_item(para_col)?
+                .get_item(stop_col)?
                 .and_then(|x| x.extract::<String>().ok());
             if para_val
                 .as_deref()
-                .is_some_and(|val| val.starts_with(para_prefix))
+                .is_some_and(|val| val.starts_with(stop_val))
             {
                 let target_before_block = match &earliest_blocker {
                     None => true,
@@ -358,33 +387,42 @@ fn propagate_target_rows(
 }
 
 #[pyfunction]
-#[pyo3(signature = (df, self_cols, parent_cols, target_col, target_key, para, plan, block_key=None))]
-fn propagate_target_from_ancestor(
+#[pyo3(signature = (df, self_cols, parent_cols, target_col, target_key, stop_point, plan, block_key=None))]
+fn find_target_value_from_ancestor(
     py: Python<'_>,
     df: &Bound<'_, PyAny>,
     self_cols: Vec<String>,
     parent_cols: Vec<String>,
     target_col: String,
     target_key: HashMap<String, String>,
-    para: HashMap<String, String>,
+    stop_point: HashMap<String, String>,
     plan: String,
     block_key: Option<HashMap<String, String>>,
 ) -> PyResult<Py<PyAny>> {
+    // 檢查key col數量是否一樣
     if self_cols.len() != parent_cols.len() {
         return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
-            "self_cols and parent_cols must have the same length",
+            "self_cols and parent_cols must have the same amount of arugments",
         ));
     }
-    if para.len() != 1 {
+    // 檢查是否只有一個stopPoint
+    if stop_point.len() != 1 {
         return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
-            "para must contain exactly one key/value pair",
+            "stop_point must contain exactly one key/value pair",
         ));
     }
-
+    // 判斷backward || forward
     let plan = parse_plan(&plan)?;
-    let (para_col, para_prefix) = para.iter().next().expect("checked len=1");
+    // 取得stopPoint HashMap裡面的col跟value
+    let (stop_col, stop_val) = stop_point.iter().next().expect("check len=1");
     let pl = py.import("polars")?;
 
+    // 將key_col合併的closure function
+    // 等於:
+    // pl.concat_str(
+    //     [pl.col("serial").cast(pl.String).fill_null("<null>"), pl.col("part").cast(pl.String).fill_null("<null>")],
+    //     separator="##"
+    // )
     let build_key_expr = |cols: &[String]| -> PyResult<Py<PyAny>> {
         let exprs = PyList::empty(py);
         for col in cols {
@@ -401,9 +439,11 @@ fn propagate_target_from_ancestor(
         Ok(key_expr.unbind())
     };
 
+    // 新增欄位名稱
     let self_key_col = "__self_key";
     let parent_key_col = "__parent_key";
 
+    // 套用closeure function
     let self_key_expr = build_key_expr(&self_cols)?
         .bind(py)
         .call_method1("alias", (self_key_col,))?
@@ -412,22 +452,27 @@ fn propagate_target_from_ancestor(
         .bind(py)
         .call_method1("alias", (parent_key_col,))?
         .unbind();
-
+    // 把function加到PyList
     let key_exprs = PyList::empty(py);
     key_exprs.append(self_key_expr.bind(py))?;
     key_exprs.append(parent_key_expr.bind(py))?;
-
+    // 新增欄位
     let df_with_keys = df.call_method1("with_columns", (key_exprs,))?;
-    let rows_list = df_with_keys
+
+    // 把dataframe轉 to_dicts=>[dict, dict]的型別再轉list
+    let row_list = df_with_keys
         .call_method0("to_dicts")?
         .cast_into::<PyList>()?;
 
-    let mut rows: Vec<Py<PyDict>> = Vec::with_capacity(rows_list.len());
-    for item in rows_list.iter() {
+    // 用with_capacity先設定好內存(Heap)空間
+    let mut rows: Vec<Py<PyDict>> = Vec::with_capacity(row_list.len());
+    // 把row_list的每一個item都加到rows
+    for item in row_list.iter() {
         rows.push(item.cast_into::<PyDict>()?.unbind());
     }
 
-    propagate_target_rows(
+    // 呼叫function
+    find_target_rows(
         py,
         &rows,
         self_key_col,
@@ -435,12 +480,13 @@ fn propagate_target_from_ancestor(
         target_col.as_str(),
         &target_key,
         block_key.as_ref(),
-        para_col,
-        para_prefix,
+        stop_col,
+        stop_val,
         plan,
     )?;
 
-    let result = pl.getattr("DataFrame")?.call1((rows_list,))?;
+    // 把row_list轉回DataFrame，並drop cols
+    let result = pl.getattr("DataFrame")?.call1((row_list,))?;
     let result = result.call_method1("drop", ((self_key_col, parent_key_col),))?;
     Ok(result.unbind())
 }
@@ -512,10 +558,10 @@ mod tests {
             );
 
             let target_key = HashMap::from([("kind".to_string(), "target".to_string())]);
-            let para_col = "event";
-            let para_prefix = "Install";
+            let stop_col = "event";
+            let stop_val = "Install";
 
-            propagate_target_rows(
+            find_target_rows(
                 py,
                 &rows,
                 "__self_key",
@@ -523,8 +569,8 @@ mod tests {
                 "ts",
                 &target_key,
                 None,
-                para_col,
-                para_prefix,
+                stop_col,
+                stop_val,
                 Plan::Backward,
             )
             .expect("propagation without blocker");
@@ -541,7 +587,7 @@ mod tests {
             rows[3].bind(py).set_item("ts", "4").expect("reset leaf ts");
 
             let blocker = HashMap::from([("event".to_string(), "Remove".to_string())]);
-            propagate_target_rows(
+            find_target_rows(
                 py,
                 &rows,
                 "__self_key",
@@ -549,8 +595,8 @@ mod tests {
                 "ts",
                 &target_key,
                 Some(&blocker),
-                para_col,
-                para_prefix,
+                stop_col,
+                stop_val,
                 Plan::Backward,
             )
             .expect("propagation with blocker");
@@ -599,7 +645,7 @@ mod tests {
             let target_key = HashMap::from([("kind".to_string(), "target".to_string())]);
             let blocker = HashMap::from([("event".to_string(), "Remove".to_string())]);
 
-            propagate_target_rows(
+            find_target_rows(
                 py,
                 &rows,
                 "__self_key",
@@ -657,7 +703,7 @@ mod tests {
             let target_key = HashMap::from([("kind".to_string(), "target".to_string())]);
             let blocker = HashMap::from([("event".to_string(), "Remove".to_string())]);
 
-            propagate_target_rows(
+            find_target_rows(
                 py,
                 &rows,
                 "__self_key",
@@ -722,7 +768,7 @@ mod tests {
             let target_key = HashMap::from([("kind".to_string(), "target".to_string())]);
             let blocker = HashMap::from([("event".to_string(), "Remove".to_string())]);
 
-            propagate_target_rows(
+            find_target_rows(
                 py,
                 &rows,
                 "__self_key",
@@ -794,7 +840,7 @@ mod tests {
             let target_key = HashMap::from([("kind".to_string(), "target".to_string())]);
             let blocker = HashMap::from([("event".to_string(), "Remove".to_string())]);
 
-            propagate_target_rows(
+            find_target_rows(
                 py,
                 &rows,
                 "__self_key",
@@ -822,8 +868,7 @@ mod tests {
 
 #[pymodule]
 fn hello_rust(m: &Bound<'_, PyModule>) -> PyResult<()> {
-    m.add_function(wrap_pyfunction!(add, m)?)?;
     m.add_function(wrap_pyfunction!(pivot_by_prefix, m)?)?;
-    m.add_function(wrap_pyfunction!(propagate_target_from_ancestor, m)?)?;
+    m.add_function(wrap_pyfunction!(find_target_value_from_ancestor, m)?)?;
     Ok(())
 }
